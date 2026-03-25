@@ -16,7 +16,6 @@ const peerServer = PeerServer({
   server: server,
   path: '/',
   allow_discovery: true,
-  live_timeout: 300000,
   proxied: true
 });
 
