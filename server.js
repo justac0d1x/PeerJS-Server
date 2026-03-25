@@ -1,107 +1,170 @@
-const { PeerServer } = require('peer');
+// ============================================================
+//  server.js — Secure message broker for render.com
+//  Node.js >= 18, no database, in-memory storage
+// ============================================================
+
 const express = require('express');
-const http = require('http');
-const PORT = process.env.PORT || 9000;
+const cors = require('cors');
+const crypto = require('crypto');
+
 const app = express();
 
-let connections = 0;
-let activeSockets = new Map(); // Храним информацию о подключениях
+// ---------- middleware ----------
+app.use(cors());
+app.use(express.json({ limit: '64kb' }));
 
-// Эндпоинт для проверки статуса сервера
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    connections,
-    activePeers: activeSockets.size 
-  });
-});
+// ---------- constants ----------
+const MESSAGE_TTL   = 30_000;   // сообщение живёт 30 с
+const USER_TTL      = 120_000;  // пользователь «жив» 2 мин
+const MAX_PER_CH    = 200;      // макс. сообщений в канале
+const CLEANUP_EVERY = 10_000;   // интервал очистки
 
-// Эндпоинт для поддержания активности (клиент будет пинговать)
-app.get('/ping', (req, res) => {
-  res.json({ pong: Date.now() });
-});
+// ---------- storage ----------
+// rooms[roomId] = {
+//   users:    { name: { lastSeen } },
+//   channels: { chName: [ { id, from, data, ts } ] }
+// }
+const rooms = Object.create(null);
 
-// Создаем HTTP сервер
-const server = http.createServer(app);
+// ---------- helpers ----------
+function getRoom(id) {
+  if (!rooms[id]) rooms[id] = { users: Object.create(null),
+                                 channels: Object.create(null) };
+  return rooms[id];
+}
 
-// Настройка PeerServer с кастомным сервером
-const peerServer = PeerServer({
-  server: server,
-  path: '/',
-  allow_discovery: true,
-  proxied: true,
-  // Увеличиваем таймауты для Render
-  alive_timeout: 60000, // 60 секунд вместо стандартных
-  concurrent_limit: 5000
-});
+function touchUser(room, name) {
+  if (!room.users[name]) room.users[name] = {};
+  room.users[name].lastSeen = Date.now();
+}
 
-// Отслеживаем подключения и отключения на уровне WebSocket
-peerServer.on('connection', (client) => {
-  connections++;
-  const clientId = client.getId();
-  
-  activeSockets.set(clientId, {
-    id: clientId,
-    connectedAt: Date.now(),
-    lastHeartbeat: Date.now()
-  });
-  
-  console.log(`Peer connected: ${clientId} (Total: ${connections})`);
-  
-  // Отправляем подтверждение клиенту
-  client.send(JSON.stringify({ type: 'CONNECTED', id: clientId }));
-});
+function cleanup() {
+  const now = Date.now();
+  for (const rid in rooms) {
+    const r = rooms[rid];
 
-peerServer.on('disconnect', (client) => {
-  connections--;
-  const clientId = client.getId();
-  
-  activeSockets.delete(clientId);
-  
-  console.log(`Peer disconnected: ${clientId} (Total: ${connections})`);
-});
-
-// Обработка ошибок
-peerServer.on('error', (error) => {
-  console.error('PeerServer error:', error);
-});
-
-// Добавляем middleware для логирования всех запросов
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-  next();
-});
-
-// Запускаем сервер
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-╔════════════════════════════════════════╗
-║   PeerJS Server is running!            ║
-║   Port: ${PORT}                         ║
-║   Time: ${new Date().toISOString()}     ║
-╚════════════════════════════════════════╝
-  `);
-});
-
-// Keep-Alive: Каждые 25 секунд отправляем пинг всем активным клиентам
-// Это предотвращает закрытие соединения Render'ом
-setInterval(() => {
-  if (activeSockets.size > 0) {
-    const now = Date.now();
-    const pingMessage = JSON.stringify({ type: 'PING', timestamp: now });
-    
-    // Отправляем пинг каждому активному клиенту через PeerServer
-    // (это работает только если клиент поддерживает получение кастомных сообщений)
-    for (const [clientId, info] of activeSockets) {
-      try {
-        // Отправляем через PeerServer API (если есть прямой доступ)
-        // В PeerServer нет прямого метода отправки, поэтому используем другой подход
-        info.lastHeartbeat = now;
-      } catch (err) {
-        console.error(`Failed to ping ${clientId}:`, err);
-      }
+    // удаляем старые сообщения
+    for (const ch in r.channels) {
+      r.channels[ch] = r.channels[ch].filter(m => now - m.ts < MESSAGE_TTL);
+      if (!r.channels[ch].length) delete r.channels[ch];
     }
-    
-    console.log(`Heartbeat sent to ${activeSockets.size} active peers`);
+
+    // удаляем неактивных пользователей
+    for (const u in r.users) {
+      if (now - r.users[u].lastSeen > USER_TTL) delete r.users[u];
+    }
+
+    // удаляем пустую комнату
+    if (!Object.keys(r.users).length) delete rooms[rid];
   }
-}, 25000); // Каждые 25 секунд
+}
+
+setInterval(cleanup, CLEANUP_EVERY);
+
+// ---------- routes ----------
+
+// Health-check (render.com пингует GET /)
+app.get('/', (_req, res) => {
+  res.json({
+    status: 'ok',
+    rooms: Object.keys(rooms).length,
+    uptime: process.uptime() | 0
+  });
+});
+
+// Войти в комнату
+app.post('/join', (req, res) => {
+  const { room, user } = req.body;
+  if (!room || !user)
+    return res.status(400).json({ error: 'room and user required' });
+
+  const r = getRoom(room);
+
+  // проверка: имя уже занято другим живым пользователем?
+  if (r.users[user] &&
+      Date.now() - r.users[user].lastSeen < USER_TTL) {
+    // тот же пользователь переподключается — ок
+  }
+
+  touchUser(r, user);
+  res.json({ ok: true, users: Object.keys(r.users) });
+});
+
+// Покинуть комнату
+app.post('/leave', (req, res) => {
+  const { room, user } = req.body;
+  if (rooms[room] && rooms[room].users[user])
+    delete rooms[room].users[user];
+  res.json({ ok: true });
+});
+
+// Отправить сообщение (зашифрованное на клиенте)
+app.post('/send', (req, res) => {
+  const { room, user, channel, data } = req.body;
+  if (!room || !user || !channel || data === undefined)
+    return res.status(400).json({ error: 'missing fields' });
+
+  if (!rooms[room])
+    return res.status(404).json({ error: 'room not found' });
+
+  const r = rooms[room];
+  touchUser(r, user);
+
+  if (!r.channels[channel]) r.channels[channel] = [];
+
+  const msg = {
+    id: crypto.randomUUID(),
+    from: user,
+    data,                       // зашифрованный base64 от клиента
+    ts: Date.now()
+  };
+
+  r.channels[channel].push(msg);
+
+  // обрезаем
+  if (r.channels[channel].length > MAX_PER_CH)
+    r.channels[channel] = r.channels[channel].slice(-MAX_PER_CH);
+
+  res.json({ ok: true, id: msg.id });
+});
+
+// Получить новые сообщения
+// cursors = { channelName: lastSeenMsgId }
+app.post('/poll', (req, res) => {
+  const { room, user, cursors = {} } = req.body;
+  if (!room || !user)
+    return res.status(400).json({ error: 'missing fields' });
+
+  if (!rooms[room])
+    return res.json({ ok: true, messages: {}, users: [] });
+
+  const r = rooms[room];
+  touchUser(r, user);
+
+  const result = {};
+
+  for (const ch in r.channels) {
+    const msgs = r.channels[ch];
+    let startIdx = 0;
+
+    if (cursors[ch]) {
+      const idx = msgs.findIndex(m => m.id === cursors[ch]);
+      if (idx !== -1) startIdx = idx + 1;
+      else startIdx = msgs.length;          // курсор устарел — пропускаем
+    }
+
+    // не отдаём собственные сообщения
+    const fresh = msgs.slice(startIdx).filter(m => m.from !== user);
+    if (fresh.length) result[ch] = fresh;
+  }
+
+  res.json({
+    ok: true,
+    messages: result,
+    users: Object.keys(r.users)
+  });
+});
+
+// ---------- start ----------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✔  Broker on :${PORT}`));
