@@ -1,6 +1,6 @@
-# WebRTC Message Broker
+# PeerJS Server
 
-Простой брокер сообщений для WebRTC приложений.
+Простой signaling сервер для WebRTC на базе PeerJS.
 
 ## Деплой на Render
    - **Environment**: `Node`
@@ -11,31 +11,14 @@
 
 | Variable | Значение |
 |----------|---------|
-| `PORT` | `3000` |
+| `PORT` | `10000` |
 
 ## Использование
 
 ```javascript
-// Присоединение к комнате
-await fetch('/join', {
-  method: 'POST',
-  body: JSON.stringify({ room: 'myroom', user: 'user1' })
+const peer = new Peer({
+  host: 'ваш-сервер.onrender.com',
+  port: 443,
+  path: '/',
+  secure: true
 });
-
-// Отправка сообщения
-await fetch('/send', {
-  method: 'POST',
-  body: JSON.stringify({ 
-    room: 'myroom', 
-    user: 'user1', 
-    channel: 'chat', 
-    data: 'Hello!' 
-  })
-});
-
-// Получение сообщений
-const { messages, users } = await fetch('/poll', {
-  method: 'POST',
-  body: JSON.stringify({ room: 'myroom', user: 'user1' })
-}).then(r => r.json());
-```
