@@ -20,10 +20,6 @@ const MAX_PER_CH    = 200;      // макс. сообщений в канале
 const CLEANUP_EVERY = 10_000;   // интервал очистки
 
 // ---------- storage ----------
-// rooms[roomId] = {
-//   users:    { name: { lastSeen } },
-//   channels: { chName: [ { id, from, data, ts } ] }
-// }
 const rooms = Object.create(null);
 
 // ---------- helpers ----------
@@ -43,18 +39,15 @@ function cleanup() {
   for (const rid in rooms) {
     const r = rooms[rid];
 
-    // удаляем старые сообщения
     for (const ch in r.channels) {
       r.channels[ch] = r.channels[ch].filter(m => now - m.ts < MESSAGE_TTL);
       if (!r.channels[ch].length) delete r.channels[ch];
     }
 
-    // удаляем неактивных пользователей
     for (const u in r.users) {
       if (now - r.users[u].lastSeen > USER_TTL) delete r.users[u];
     }
 
-    // удаляем пустую комнату
     if (!Object.keys(r.users).length) delete rooms[rid];
   }
 }
@@ -63,7 +56,6 @@ setInterval(cleanup, CLEANUP_EVERY);
 
 // ---------- routes ----------
 
-// Health-check (render.com пингует GET /)
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
@@ -72,25 +64,20 @@ app.get('/', (_req, res) => {
   });
 });
 
-// Войти в комнату
 app.post('/join', (req, res) => {
   const { room, user } = req.body;
   if (!room || !user)
     return res.status(400).json({ error: 'room and user required' });
 
   const r = getRoom(room);
-
-  // проверка: имя уже занято другим живым пользователем?
   if (r.users[user] &&
       Date.now() - r.users[user].lastSeen < USER_TTL) {
-    // тот же пользователь переподключается — ок
   }
 
   touchUser(r, user);
   res.json({ ok: true, users: Object.keys(r.users) });
 });
 
-// Покинуть комнату
 app.post('/leave', (req, res) => {
   const { room, user } = req.body;
   if (rooms[room] && rooms[room].users[user])
@@ -98,7 +85,6 @@ app.post('/leave', (req, res) => {
   res.json({ ok: true });
 });
 
-// Отправить сообщение (зашифрованное на клиенте)
 app.post('/send', (req, res) => {
   const { room, user, channel, data } = req.body;
   if (!room || !user || !channel || data === undefined)
@@ -115,21 +101,17 @@ app.post('/send', (req, res) => {
   const msg = {
     id: crypto.randomUUID(),
     from: user,
-    data,                       // зашифрованный base64 от клиента
+    data,
     ts: Date.now()
   };
 
   r.channels[channel].push(msg);
-
-  // обрезаем
   if (r.channels[channel].length > MAX_PER_CH)
     r.channels[channel] = r.channels[channel].slice(-MAX_PER_CH);
 
   res.json({ ok: true, id: msg.id });
 });
 
-// Получить новые сообщения
-// cursors = { channelName: lastSeenMsgId }
 app.post('/poll', (req, res) => {
   const { room, user, cursors = {} } = req.body;
   if (!room || !user)
@@ -140,7 +122,6 @@ app.post('/poll', (req, res) => {
 
   const r = rooms[room];
   touchUser(r, user);
-
   const result = {};
 
   for (const ch in r.channels) {
@@ -150,10 +131,9 @@ app.post('/poll', (req, res) => {
     if (cursors[ch]) {
       const idx = msgs.findIndex(m => m.id === cursors[ch]);
       if (idx !== -1) startIdx = idx + 1;
-      else startIdx = msgs.length;          // курсор устарел — пропускаем
+      else startIdx = msgs.length;
     }
 
-    // не отдаём собственные сообщения
     const fresh = msgs.slice(startIdx).filter(m => m.from !== user);
     if (fresh.length) result[ch] = fresh;
   }
@@ -167,4 +147,4 @@ app.post('/poll', (req, res) => {
 
 // ---------- start ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✔  Broker on :${PORT}`));
+app.listen(PORT, () => console.log(`Broker on :${PORT}`));
